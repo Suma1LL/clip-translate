@@ -1,0 +1,8 @@
+# clip-translate 配置（复制为 ~/.config/clip-translate.conf 并填写）
+# Anthropic 兼容端点：任何 {BASE_URL}/v1/messages 可用的地址
+# 示例：智谱 BigModel 的 Anthropic 兼容端点（国内直连）
+BASE_URL="https://open.bigmodel.cn/api/anthropic"
+# 你的 API Key（此文件仅保存在本机，请保持 600 权限）
+API_KEY="sk-xxxxxxxx"
+# 模型名（格式依网关而定，通常带供应商前缀）
+MODEL="zhipuai/glm-4.6"

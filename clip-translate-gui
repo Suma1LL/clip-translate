@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+# 剪贴板翻译 GUI：复制英文后自动弹出（或 Super+T 手动）
+# 置顶小窗：上=原文、下=译文（流式），译文可选中复制；Esc 关闭
+# 按钮行含引擎下拉：切换后立即重译当前文本，并写回 conf 记住选择
+import gi, json, os, re, sys, threading, urllib.request
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk, Gio, GLib
+
+CONF_PATH = os.path.expanduser('~/.config/clip-translate.conf')
+PROMPT = ('You are a translation engine. Translate the following English text into '
+          'concise and natural Chinese. Keep technical terms/code identifiers in English '
+          'where appropriate. Output ONLY the translation, no explanations.\n\n')
+
+# (模型ID, 显示名, 是否支持禁用思考)
+ENGINES = [
+    ('xiaomi/mimo-v2.6-pro', 'MiMo v2.6 Pro（快）', True),
+    ('zhipuai/glm-4.6', 'GLM-4.6（稳）', True),
+    ('zhipuai/glm-5.3', 'GLM-5.3（强·慢）', False),
+]
+
+ENABLED_FILE = os.path.expanduser('~/.config/clip-translate.enabled')
+
+
+def is_enabled():
+    try:
+        return open(ENABLED_FILE).read().strip() != '0'
+    except (OSError, ValueError):
+        return True
+
+
+def set_enabled(v):
+    try:
+        with open(ENABLED_FILE, 'w') as f:
+            f.write('1' if v else '0')
+    except OSError:
+        pass
+
+
+def load_conf():
+    conf = {}
+    with open(CONF_PATH) as f:
+        for line in f:
+            m = re.match(r'(\w+)="([^"]*)"', line.strip())
+            if m:
+                conf[m.group(1)] = m.group(2)
+    return conf
+
+
+def save_model(mid):
+    """把选择的引擎写回 conf（保留 BASE_URL/API_KEY 等其它行）"""
+    try:
+        with open(CONF_PATH) as f:
+            lines = f.readlines()
+        out, found = [], False
+        for ln in lines:
+            if ln.startswith('MODEL='):
+                out.append('MODEL="%s"\n' % mid)
+                found = True
+            else:
+                out.append(ln)
+        if not found:
+            out.append('MODEL="%s"\n' % mid)
+        with open(CONF_PATH, 'w') as f:
+            f.writelines(out)
+    except Exception:
+        pass
+
+
+def is_english(t):
+    return bool(re.search(r'[A-Za-z]', t)) and not re.search(r'[一-鿿]', t)
+
+
+def scroll(widget):
+    sw = Gtk.ScrolledWindow()
+    sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+    sw.set_shadow_type(Gtk.ShadowType.IN)
+    sw.add(widget)
+    return sw
+
+
+class TranslateWin(Gtk.Window):
+    def __init__(self, conf):
+        super().__init__(title='翻译')
+        self.conf = conf
+        self.gen = 0  # 翻译代际：切换引擎/重译时+1，旧线程结果自动丢弃
+        self.set_default_size(520, 330)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_position(Gtk.WindowPosition.MOUSE)
+        if '--passive' in sys.argv:  # 自动弹窗模式：不抢键盘焦点
+            self.set_focus_on_map(False)
+        self.connect('key-press-event', self.on_key)
+        self.connect('destroy', Gtk.main_quit)
+
+        css = Gtk.CssProvider()
+        css.load_from_data(b'textview#src { opacity: 0.65; font-size: 0.92em; }')
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                       margin_top=8, margin_bottom=8, margin_start=10, margin_end=10)
+        self.add(vbox)
+
+        # 原文（只读灰色）
+        self.src_buf = Gtk.TextBuffer()
+        self.src_buf.set_text('(读取中…)')
+        src_view = Gtk.TextView(buffer=self.src_buf, editable=False, cursor_visible=False,
+                                wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        src_view.set_name('src')
+        vbox.pack_start(scroll(src_view), True, True, 0)
+
+        vbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
+
+        # 译文（可选中复制）
+        self.dst_buf = Gtk.TextBuffer()
+        dst_view = Gtk.TextView(buffer=self.dst_buf, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        dst_view.grab_focus()
+        vbox.pack_start(scroll(dst_view), True, True, 1)
+
+        # 按钮行：spinner | 引擎下拉 | 复制译文 | 关闭
+        hbox = Gtk.Box(spacing=6)
+        self.spinner = Gtk.Spinner()
+        self.spinner.start()
+        self.btn_auto = Gtk.Button(label='自动：开' if is_enabled() else '自动：关')
+        self.btn_auto.set_tooltip_text('自动弹窗翻译开关：关闭后复制英文不再弹窗，'
+                                       '仍可用 Super+T 手动翻译；下次复制英文前记得先打开')
+        self.btn_auto.connect('clicked', self.on_auto_clicked)
+        self.engine_combo = Gtk.ComboBoxText()
+        cur = conf.get('MODEL', ENGINES[0][0])
+        for mid, label, _ in ENGINES:
+            self.engine_combo.append(mid, label)
+        if cur not in [e[0] for e in ENGINES]:  # conf 里手改过其它模型：原样加为选项
+            self.engine_combo.append(cur, cur)
+        self.engine_combo.set_active_id(cur)
+        self.engine_combo.connect('changed', self.on_engine_changed)
+        self.engine_combo.set_tooltip_text('切换翻译引擎：立即重译并记住选择')
+        self.btn_copy = Gtk.Button(label='复制译文')
+        self.btn_copy.connect('clicked', self.on_copy)
+        btn_close = Gtk.Button(label='关闭')
+        btn_close.connect('clicked', Gtk.main_quit)
+        hbox.pack_start(self.spinner, False, False, 0)
+        hbox.pack_start(self.btn_auto, False, False, 0)
+        hbox.pack_start(self.engine_combo, False, False, 0)
+        hbox.pack_start(self.btn_copy, False, False, 0)
+        hbox.pack_end(btn_close, False, False, 0)
+        vbox.pack_start(hbox, False, False, 0)
+
+        self.show_all()
+        args = sys.argv[1:]
+        if '--text' in args and args.index('--text') + 1 < len(args):
+            self.src_text = args[args.index('--text') + 1].strip()
+            self.src_buf.set_text(self.src_text[:3000] if self.src_text else '(剪贴板为空)')
+            self.after_text_ready()
+        else:
+            GLib.idle_add(self.fetch_text)
+
+    def fetch_text(self):
+        text = ''
+        # 1) 问 GPaste 要最新条目（D-Bus，不依赖 GDK 的 Wayland selection 时序）
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            res = bus.call_sync('org.gnome.GPaste', '/org/gnome/GPaste',
+                                'org.gnome.GPaste2', 'GetElementAtIndex',
+                                GLib.Variant('(t)', (0,)), None,
+                                Gio.DBusCallFlags.NONE, -1, None)
+            text = (res.unpack()[1] or '').strip()
+        except Exception:
+            pass
+        # 2) fallback：GDK 读（此时窗口已映射，可正常读取）
+        if not text:
+            cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            text = (cb.wait_for_text() or '').strip()
+        self.src_text = text
+        self.src_buf.set_text(text[:3000] if text else '(剪贴板为空)')
+        self.after_text_ready()
+        return False
+
+    def after_text_ready(self):
+        if self.src_text and is_english(self.src_text):
+            self.retranslate()
+        else:
+            self.spinner.stop()
+            self.dst_buf.set_text('(剪贴板内容不是英文，已跳过翻译)' if self.src_text else '(剪贴板为空)')
+
+    def on_engine_changed(self, combo):
+        save_model(combo.get_active_id())  # 记住选择
+        if self.src_text and is_english(self.src_text):
+            self.retranslate()
+
+    def on_auto_clicked(self, btn):
+        new = not is_enabled()
+        set_enabled(new)
+        btn.set_label('自动：开' if new else '自动：关')
+
+    def retranslate(self):
+        # 主线程先抓取引擎参数，worker 线程不碰 GTK 控件
+        self.gen += 1
+        self.req_model = self.engine_combo.get_active_id()
+        self.req_no_think = any(m == self.req_model and dis for m, _, dis in ENGINES)
+        self.dst_buf.set_text('')
+        self.spinner.start()
+        threading.Thread(target=self.worker, daemon=True).start()
+
+    def worker(self):
+        gen, model, no_think = self.gen, self.req_model, self.req_no_think
+        payload = {
+            'model': model,
+            'max_tokens': 2048, 'stream': True,
+            'messages': [{'role': 'user', 'content': PROMPT + self.src_text[:3000]}],
+        }
+        if no_think:
+            payload['thinking'] = {'type': 'disabled'}
+        req = urllib.request.Request(
+            self.conf['BASE_URL'].rstrip('/') + '/v1/messages',
+            data=json.dumps(payload).encode(),
+            headers={'x-api-key': self.conf['API_KEY'],
+                     'anthropic-version': '2023-06-01',
+                     'content-type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                for raw in r:
+                    line = raw.decode('utf-8', 'replace').strip()
+                    if not line.startswith('data:'):
+                        continue
+                    data = line[5:].strip()
+                    if data == '[DONE]':
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get('type') == 'content_block_delta':
+                        delta = obj.get('delta', {})
+                        if delta.get('type') == 'text_delta' and delta.get('text'):
+                            GLib.idle_add(self.append, gen, delta['text'])
+                    elif obj.get('type') == 'error':
+                        msg = json.dumps(obj.get('error', {}), ensure_ascii=False)
+                        GLib.idle_add(self.append, gen, '\n[错误] ' + msg)
+                        break
+        except Exception as e:
+            GLib.idle_add(self.append, gen, '\n[错误] %s' % e)
+        GLib.idle_add(self.stop_spinner, gen)
+
+    def append(self, gen, text):
+        if gen != self.gen:
+            return False  # 已切换引擎，旧结果丢弃
+        self.dst_buf.insert(self.dst_buf.get_end_iter(), text)
+        return False
+
+    def stop_spinner(self, gen):
+        if gen == self.gen:
+            self.spinner.stop()
+        return False
+
+    def on_copy(self, btn):
+        text = self.dst_buf.get_text(self.dst_buf.get_start_iter(),
+                                     self.dst_buf.get_end_iter(), False)
+        if text.strip():
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+            btn.set_label('已复制 ✓')
+            GLib.timeout_add(1200, lambda: (btn.set_label('复制译文'), False)[1])
+
+    def on_key(self, w, ev):
+        if ev.keyval == Gdk.KEY_Escape:
+            Gtk.main_quit()
+            return True
+        return False
+
+
+if __name__ == '__main__':
+    TranslateWin(load_conf())
+    Gtk.main()

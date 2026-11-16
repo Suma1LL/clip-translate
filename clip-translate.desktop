@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=剪贴板翻译
+Name[en]=Clipboard Translate
+Comment=翻译当前剪贴板内容（先复制英文，再打开本应用）
+Comment[en]=Translate the current clipboard content
+Exec=clip-translate-gui
+Icon=preferences-desktop-locale
+Terminal=false
+Categories=Utility;
+Keywords=翻译;translate;fanyi;fy;clipboard;剪贴板;词典;dictionary;
+StartupNotify=false

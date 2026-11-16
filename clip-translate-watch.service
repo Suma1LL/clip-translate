@@ -1,0 +1,11 @@
+[Unit]
+Description=Clipboard auto-translate watcher (GPaste event driven)
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/clip-translate-watch
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
