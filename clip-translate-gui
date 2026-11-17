@@ -2,7 +2,7 @@
 # 剪贴板翻译 GUI：复制英文后自动弹出（或 Super+T 手动）
 # 置顶小窗：上=原文、下=译文（流式），译文可选中复制；Esc 关闭
 # 按钮行含引擎下拉：切换后立即重译当前文本，并写回 conf 记住选择
-import gi, json, os, re, sys, threading, urllib.request
+import atexit, gi, json, os, re, signal, sys, threading, urllib.request
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, Gio, GLib
 
@@ -32,6 +32,25 @@ def set_enabled(v):
     try:
         with open(ENABLED_FILE, 'w') as f:
             f.write('1' if v else '0')
+    except OSError:
+        pass
+
+
+REG_DIR = '/tmp/clip-translate-gui.pids'
+
+
+def register_instance():
+    """把本窗口 PID 登记到注册目录：监听器据此实现单窗口更新（手动/自动窗口统一管理）"""
+    def _unregister():
+        try:
+            os.remove(os.path.join(REG_DIR, str(os.getpid())))
+        except OSError:
+            pass
+    try:
+        os.makedirs(REG_DIR, exist_ok=True)
+        open(os.path.join(REG_DIR, str(os.getpid())), 'w').close()
+        atexit.register(_unregister)
+        signal.signal(signal.SIGTERM, lambda *a: Gtk.main_quit())  # 优雅退出→触发atexit清理
     except OSError:
         pass
 
@@ -268,5 +287,6 @@ class TranslateWin(Gtk.Window):
 
 
 if __name__ == '__main__':
+    register_instance()
     TranslateWin(load_conf())
     Gtk.main()

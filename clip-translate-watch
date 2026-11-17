@@ -5,7 +5,7 @@ import os, re, signal, subprocess
 from gi.repository import Gio, GLib
 
 GUI = os.path.expanduser('~/.local/bin/clip-translate-gui')
-PID_FILE = '/tmp/clip-translate-gui.pid'
+REG_DIR = '/tmp/clip-translate-gui.pids'
 ENABLED_FILE = os.path.expanduser('~/.config/clip-translate.enabled')
 DEST, PATH, IFACE = 'org.gnome.GPaste', '/org/gnome/GPaste', 'org.gnome.GPaste2'
 MAX_LEN = 5000
@@ -43,6 +43,30 @@ def latest_text():
     return (res.unpack()[1] or '') if res else ''
 
 
+def kill_all_guis():
+    """杀掉所有已注册的翻译窗口（含手动打开的，实现真正的单窗口更新）。
+    逐一校验 /proc/<pid>/cmdline，防止 PID 复用误杀无辜进程。"""
+    try:
+        names = os.listdir(REG_DIR)
+    except OSError:
+        return
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open('/proc/%d/cmdline' % pid, 'rb') as f:
+                if b'clip-translate-gui' not in f.read():
+                    raise OSError('PID reused')
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            os.remove(os.path.join(REG_DIR, name))
+        except OSError:
+            pass
+
+
 def on_update(conn, sender, path, iface, sig_name, params):
     if not is_enabled():
         return
@@ -54,16 +78,10 @@ def on_update(conn, sender, path, iface, sig_name, params):
     except Exception:
         return
     if text and len(text) <= MAX_LEN and is_english(text):
-        # 单窗口体验：按 PID 精确关旧窗口再弹新的（不用 pkill -f，避免误杀无关进程）
+        # 单窗口更新：收掉所有已注册窗口（手动+自动），再弹最新内容的窗口
+        kill_all_guis()
         try:
-            old_pid = int(open(PID_FILE).read().strip())
-            os.kill(old_pid, signal.SIGTERM)
-        except Exception:  # 杀旧窗口失败（PID过期/文件缺失）不影响弹新窗口
-            pass
-        try:
-            proc = subprocess.Popen([GUI, '--passive', '--text', text], start_new_session=True)
-            with open(PID_FILE, 'w') as f:
-                f.write(str(proc.pid))
+            subprocess.Popen([GUI, '--passive', '--text', text], start_new_session=True)
         except Exception:
             pass
 
