@@ -3,6 +3,10 @@
 # - 自动模式：watch 经 unix socket 推送新文本，窗口原地更新（不重开、不跳位置、不抢焦点）
 # - 手动模式：GNOME 搜索打开；若已有实例则激活现有窗口并更新
 # - 单实例：abstract socket 绑定失败 = 已有实例，转客户端发送文本后退出
+# 注：GNOME Wayland 没有置顶协议（set_keep_above 被 Mutter 忽略），
+#     因此强制跑在 XWayland 下，用 X11 的 EWMH ABOVE 实现真正的置顶
+import os
+os.environ.setdefault('GDK_BACKEND', 'x11')
 import gi, json, os, re, signal, socket, sys, threading, urllib.request
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, Gio, GLib
