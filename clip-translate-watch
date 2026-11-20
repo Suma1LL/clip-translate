@@ -13,6 +13,7 @@ DEST, PATH, IFACE = 'org.gnome.GPaste', '/org/gnome/GPaste', 'org.gnome.GPaste2'
 MAX_LEN = 5000
 
 fail_count = 0
+last_seen_text = None  # 上次已知的 GPaste 历史[0]，用于假死恢复后补漏
 
 
 def is_enabled():
@@ -51,6 +52,47 @@ def spawn_gpaste():
         print('failed to spawn gpaste-daemon: %s' % e, flush=True)
 
 
+def gpaste_pid():
+    """GPaste daemon 的 PID（经 org.freedesktop.DBus 查 name owner），校验 cmdline 防误杀"""
+    try:
+        owner = bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                              'org.freedesktop.DBus', 'GetNameOwner',
+                              GLib.Variant('(s)', (DEST,)), None,
+                              Gio.DBusCallFlags.NONE, 5, None).unpack()[0]
+        pid = bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                            'org.freedesktop.DBus', 'GetConnectionUnixProcessID',
+                            GLib.Variant('(s)', (owner,)), None,
+                            Gio.DBusCallFlags.NONE, 5, None).unpack()[0]
+        with open('/proc/%d/cmdline' % pid, 'rb') as f:
+            if b'gpaste' in f.read():
+                return int(pid)
+    except Exception as e:
+        print('gpaste_pid failed: %s' % e, flush=True)
+    return None
+
+
+def launch_gui(text):
+    kill_all_guis()
+    try:
+        subprocess.Popen([GUI, '--passive', '--text', text], start_new_session=True)
+    except Exception as e:
+        print('failed to launch GUI: %s' % e, flush=True)
+
+
+def recover_missed():
+    """daemon 假死恢复/重启后：若 GPaste[0] 与上次已知不同，说明错过了一次剪贴板变化，补处理"""
+    global last_seen_text
+    try:
+        text = latest_text().strip()
+    except Exception:
+        return
+    if text != last_seen_text:
+        print('recovered missed clipboard change', flush=True)
+        last_seen_text = text
+        if is_enabled() and text and len(text) <= MAX_LEN and is_english(text):
+            launch_gui(text)
+
+
 def health_check():
     """周期自检（30s）：
     - bus 断开：信号订阅已失效 → 退出让 systemd 重建（新连接+新订阅）
@@ -62,10 +104,24 @@ def health_check():
         return False
     if gpaste_alive():
         fail_count = 0
+        recover_missed()
         return True
     fail_count += 1
     if fail_count == 1:
         spawn_gpaste()
+    elif fail_count == 3:
+        # 持续假死（~90s）：旧 daemon 占着 well-known name，spawn 的新实例起不来。
+        # 杀掉假死实例再拉起（GPaste 历史有磁盘持久化，替换不丢）
+        pid = gpaste_pid()
+        if pid:
+            print('killing stuck gpaste-daemon pid=%d' % pid, flush=True)
+            try:
+                os.kill(pid, signal.SIGKILL)  # 假死实例可能不响应 SIGTERM
+            except OSError as e:
+                print('kill failed: %s' % e, flush=True)
+            GLib.timeout_add_seconds(2, spawn_gpaste)
+        else:
+            spawn_gpaste()
     if fail_count >= 10:
         print('gpaste unreachable after %d checks, exiting for restart' % fail_count, flush=True)
         os.kill(os.getpid(), signal.SIGTERM)
@@ -105,8 +161,7 @@ def kill_all_guis():
 
 
 def on_update(conn, sender, path, iface, sig_name, params):
-    if not is_enabled():
-        return
+    global last_seen_text
     vals = params.unpack() if params else ()
     if not vals or vals[0] != 'REPLACE':
         return
@@ -115,18 +170,23 @@ def on_update(conn, sender, path, iface, sig_name, params):
     except Exception as e:
         print('latest_text failed: %s' % e, flush=True)
         return
+    last_seen_text = text
+    if not is_enabled():
+        print('event skipped (auto-translate disabled)', flush=True)
+        return
+    # 单窗口更新：收掉所有已注册窗口（手动+自动），再弹最新内容的窗口
     if text and len(text) <= MAX_LEN and is_english(text):
-        # 单窗口更新：收掉所有已注册窗口（手动+自动），再弹最新内容的窗口
-        kill_all_guis()
-        try:
-            subprocess.Popen([GUI, '--passive', '--text', text], start_new_session=True)
-        except Exception as e:
-            print('failed to launch GUI: %s' % e, flush=True)
+        launch_gui(text)
 
 
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # 自动回收子进程，防 spawn 的 daemon 退出后变僵尸
 print('watch started, pid=%d' % os.getpid(), flush=True)
 if not gpaste_alive():
     spawn_gpaste()
+try:  # 基线：记录启动时的 GPaste[0]，避免把旧内容当作新事件
+    last_seen_text = latest_text().strip()
+except Exception:
+    last_seen_text = None
 bus.signal_subscribe(None, IFACE, 'Update', PATH, None,
                      Gio.DBusSignalFlags.NONE, on_update)
 GLib.timeout_add_seconds(30, health_check)
