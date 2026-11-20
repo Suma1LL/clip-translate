@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-# 剪贴板翻译 GUI：复制英文后自动弹出（或 Super+T 手动）
-# 置顶小窗：上=原文、下=译文（流式），译文可选中复制；Esc 关闭
-# 按钮行含引擎下拉：切换后立即重译当前文本，并写回 conf 记住选择
-import atexit, gi, json, os, re, signal, sys, threading, urllib.request
+# 剪贴板翻译 GUI：常驻窗口模式
+# - 自动模式：watch 经 unix socket 推送新文本，窗口原地更新（不重开、不跳位置、不抢焦点）
+# - 手动模式：GNOME 搜索打开；若已有实例则激活现有窗口并更新
+# - 单实例：abstract socket 绑定失败 = 已有实例，转客户端发送文本后退出
+import gi, json, os, re, signal, socket, sys, threading, urllib.request
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, Gio, GLib
 
 CONF_PATH = os.path.expanduser('~/.config/clip-translate.conf')
+SOCK = '\0clip-translate-gui'  # Linux abstract unix socket，进程退出自动消失
 PROMPT = ('You are a translation engine. Translate the following English text into '
           'concise and natural Chinese. Keep technical terms/code identifiers in English '
           'where appropriate. Output ONLY the translation, no explanations.\n\n')
@@ -19,40 +21,6 @@ ENGINES = [
 ]
 
 ENABLED_FILE = os.path.expanduser('~/.config/clip-translate.enabled')
-
-
-def is_enabled():
-    try:
-        return open(ENABLED_FILE).read().strip() != '0'
-    except (OSError, ValueError):
-        return True
-
-
-def set_enabled(v):
-    try:
-        with open(ENABLED_FILE, 'w') as f:
-            f.write('1' if v else '0')
-    except OSError:
-        pass
-
-
-REG_DIR = '/tmp/clip-translate-gui.pids'
-
-
-def register_instance():
-    """把本窗口 PID 登记到注册目录：监听器据此实现单窗口更新（手动/自动窗口统一管理）"""
-    def _unregister():
-        try:
-            os.remove(os.path.join(REG_DIR, str(os.getpid())))
-        except OSError:
-            pass
-    try:
-        os.makedirs(REG_DIR, exist_ok=True)
-        open(os.path.join(REG_DIR, str(os.getpid())), 'w').close()
-        atexit.register(_unregister)
-        signal.signal(signal.SIGTERM, lambda *a: Gtk.main_quit())  # 优雅退出→触发atexit清理
-    except OSError:
-        pass
 
 
 def load_conf():
@@ -85,6 +53,21 @@ def save_model(mid):
         pass
 
 
+def is_enabled():
+    try:
+        return open(ENABLED_FILE).read().strip() != '0'
+    except (OSError, ValueError):
+        return True
+
+
+def set_enabled(v):
+    try:
+        with open(ENABLED_FILE, 'w') as f:
+            f.write('1' if v else '0')
+    except OSError:
+        pass
+
+
 def is_english(t):
     return bool(re.search(r'[A-Za-z]', t)) and not re.search(r'[一-鿿]', t)
 
@@ -98,15 +81,15 @@ def scroll(widget):
 
 
 class TranslateWin(Gtk.Window):
-    def __init__(self, conf):
+    def __init__(self, conf, text_arg=None, passive=False):
         super().__init__(title='翻译')
         self.conf = conf
-        self.gen = 0  # 翻译代际：切换引擎/重译时+1，旧线程结果自动丢弃
+        self.gen = 0  # 翻译代际：切换引擎/新文本时+1，旧线程结果自动丢弃
         self.set_default_size(520, 330)
         self.set_keep_above(True)
         self.set_skip_taskbar_hint(True)
         self.set_position(Gtk.WindowPosition.MOUSE)
-        if '--passive' in sys.argv:  # 自动弹窗模式：不抢键盘焦点
+        if passive:  # 自动弹窗模式：不抢键盘焦点
             self.set_focus_on_map(False)
         self.connect('key-press-event', self.on_key)
         self.connect('destroy', Gtk.main_quit)
@@ -136,13 +119,13 @@ class TranslateWin(Gtk.Window):
         dst_view.grab_focus()
         vbox.pack_start(scroll(dst_view), True, True, 1)
 
-        # 按钮行：spinner | 引擎下拉 | 复制译文 | 关闭
+        # 按钮行：spinner | 自动开关 | 引擎下拉 | 复制译文
         hbox = Gtk.Box(spacing=6)
         self.spinner = Gtk.Spinner()
         self.spinner.start()
         self.btn_auto = Gtk.Button(label='自动：开' if is_enabled() else '自动：关')
         self.btn_auto.set_tooltip_text('自动弹窗翻译开关：关闭后复制英文不再弹窗，'
-                                       '仍可用 Super+T 手动翻译；下次复制英文前记得先打开')
+                                       '仍可用 GNOME 搜索「翻译」手动打开')
         self.btn_auto.connect('clicked', self.on_auto_clicked)
         self.engine_combo = Gtk.ComboBoxText()
         cur = conf.get('MODEL', ENGINES[0][0])
@@ -162,9 +145,8 @@ class TranslateWin(Gtk.Window):
         vbox.pack_start(hbox, False, False, 0)
 
         self.show_all()
-        args = sys.argv[1:]
-        if '--text' in args and args.index('--text') + 1 < len(args):
-            self.src_text = args[args.index('--text') + 1].strip()
+        if text_arg is not None:
+            self.src_text = text_arg.strip()
             self.src_buf.set_text(self.src_text[:3000] if self.src_text else '(剪贴板为空)')
             self.after_text_ready()
         else:
@@ -197,6 +179,18 @@ class TranslateWin(Gtk.Window):
         else:
             self.spinner.stop()
             self.dst_buf.set_text('(剪贴板内容不是英文，已跳过翻译)' if self.src_text else '(剪贴板为空)')
+
+    def show_new_text(self, text, present):
+        """socket 推送的新内容：原地更新（present=手动触发时前置窗口）"""
+        if present:
+            self.present()
+        if text:
+            self.src_text = text.strip()
+            self.src_buf.set_text(self.src_text[:3000] if self.src_text else '(剪贴板为空)')
+            self.after_text_ready()
+        else:
+            GLib.idle_add(self.fetch_text)
+        return False
 
     def on_engine_changed(self, combo):
         save_model(combo.get_active_id())  # 记住选择
@@ -259,7 +253,7 @@ class TranslateWin(Gtk.Window):
 
     def append(self, gen, text):
         if gen != self.gen:
-            return False  # 已切换引擎，旧结果丢弃
+            return False  # 已有新内容/新引擎，旧结果丢弃
         self.dst_buf.insert(self.dst_buf.get_end_iter(), text)
         return False
 
@@ -283,7 +277,67 @@ class TranslateWin(Gtk.Window):
         return False
 
 
+def try_bind():
+    """绑定 abstract socket：成功=本进程为唯一实例，失败=已有实例"""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.bind(SOCK)
+        s.listen(4)
+        return s
+    except OSError:
+        s.close()
+        return None
+
+
+def send_to_existing(text, manual):
+    """把文本转交给已有实例（manual=True 请求前置窗口）"""
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(2)
+        c.connect(SOCK)
+        c.sendall((b'M' if manual else b'W') + text.encode())
+        c.close()
+        return True
+    except OSError:
+        return False
+
+
+def serve_socket(srv, win):
+    """accept 循环：协议 = 1字节标志(M=手动/W=自动) + UTF-8 文本"""
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return
+
+        def handle(conn=conn):
+            with conn:
+                data = b''
+                while len(data) < 60000:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+            if data:
+                GLib.idle_add(win.show_new_text,
+                              data[1:].decode('utf-8', 'replace'),
+                              data[:1] == b'M')
+
+        threading.Thread(target=handle, daemon=True).start()
+
+
 if __name__ == '__main__':
-    register_instance()
-    TranslateWin(load_conf())
+    args = sys.argv[1:]
+    passive = '--passive' in args
+    text_arg = None
+    if '--text' in args and args.index('--text') + 1 < len(args):
+        text_arg = args[args.index('--text') + 1]
+    srv = try_bind()
+    if srv is None:
+        # 已有常驻实例：转交文本后退出（手动打开→前置窗口；自动→安静更新）
+        send_to_existing(text_arg or '', manual=not passive)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, lambda *a: Gtk.main_quit())
+    win = TranslateWin(load_conf(), text_arg, passive)
+    threading.Thread(target=serve_socket, args=(srv, win), daemon=True).start()
     Gtk.main()

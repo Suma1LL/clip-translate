@@ -2,12 +2,12 @@
 # clip-translate-watch: 订阅 GPaste 剪贴板事件 → 复制英文自动弹翻译窗口（passive 模式，不抢焦点）
 # systemd user service: clip-translate-watch.service
 # 自愈机制：D-Bus 连接断开或 GPaste 持续不可达时主动退出，由 systemd Restart=always 拉起重建
-import os, re, signal, subprocess
+import os, re, signal, socket, subprocess
 from gi.repository import Gio, GLib
 
 GUI = os.path.expanduser('~/.local/bin/clip-translate-gui')
 ENABLED_FILE = os.path.expanduser('~/.config/clip-translate.enabled')
-REG_DIR = '/tmp/clip-translate-gui.pids'
+SOCK = '\0clip-translate-gui'  # 常驻翻译窗口的 abstract unix socket
 GPASTE_DAEMON = '/usr/libexec/gpaste/gpaste-daemon'
 DEST, PATH, IFACE = 'org.gnome.GPaste', '/org/gnome/GPaste', 'org.gnome.GPaste2'
 MAX_LEN = 5000
@@ -72,7 +72,16 @@ def gpaste_pid():
 
 
 def launch_gui(text):
-    kill_all_guis()
+    """优先推送给常驻窗口（原地更新，不闪跳）；无实例时启动新窗口"""
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(2)
+        c.connect(SOCK)
+        c.sendall(b'W' + text.encode())
+        c.close()
+        return
+    except OSError:
+        pass
     try:
         subprocess.Popen([GUI, '--passive', '--text', text], start_new_session=True)
     except Exception as e:
@@ -134,30 +143,6 @@ def latest_text():
                         GLib.Variant('(t)', (0,)), None,
                         Gio.DBusCallFlags.NONE, 5, None)
     return (res.unpack()[1] or '') if res else ''
-
-
-def kill_all_guis():
-    """杀掉所有已注册的翻译窗口（含手动打开的，实现真正的单窗口更新）。
-    逐一校验 /proc/<pid>/cmdline，防止 PID 复用误杀无辜进程。"""
-    try:
-        names = os.listdir(REG_DIR)
-    except OSError:
-        return
-    for name in names:
-        if not name.isdigit():
-            continue
-        pid = int(name)
-        try:
-            with open('/proc/%d/cmdline' % pid, 'rb') as f:
-                if b'clip-translate-gui' not in f.read():
-                    raise OSError('PID reused')
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-        try:
-            os.remove(os.path.join(REG_DIR, name))
-        except OSError:
-            pass
 
 
 def on_update(conn, sender, path, iface, sig_name, params):
