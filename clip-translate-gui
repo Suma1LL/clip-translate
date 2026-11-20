@@ -7,12 +7,23 @@
 #     因此强制跑在 XWayland 下，用 X11 的 EWMH ABOVE 实现真正的置顶
 import os
 os.environ.setdefault('GDK_BACKEND', 'x11')
-import gi, json, os, re, signal, socket, sys, threading, urllib.request
+import gi, json, os, re, signal, socket, sys, threading, time, urllib.request
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, Gio, GLib
 
 CONF_PATH = os.path.expanduser('~/.config/clip-translate.conf')
 SOCK = '\0clip-translate-gui'  # Linux abstract unix socket，进程退出自动消失
+LOG_FILE = '/tmp/clip-translate-gui.log'
+
+
+def log(msg):
+    """诊断日志：落盘 + stdout（GNOME 启动的应用 stdout 会被丢弃，落盘才能看到）"""
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write('%s pid=%d %s\n' % (time.strftime('%H:%M:%S'), os.getpid(), msg))
+    except OSError:
+        pass
+    print(msg, flush=True)
 PROMPT = ('You are a translation engine. Translate the following English text into '
           'concise and natural Chinese. Keep technical terms/code identifiers in English '
           'where appropriate. Output ONLY the translation, no explanations.\n\n')
@@ -91,7 +102,8 @@ class TranslateWin(Gtk.Window):
         self.gen = 0  # 翻译代际：切换引擎/新文本时+1，旧线程结果自动丢弃
         self.set_default_size(520, 330)
         self.set_keep_above(True)
-        self.set_skip_taskbar_hint(True)
+        # 不隐藏任务栏图标：Dock 常驻图标是最小化后找回窗口的唯一入口
+        # （X11 置顶+skip_taskbar 组合下 Mutter 会剥夺最小化能力）
         self.set_position(Gtk.WindowPosition.MOUSE)
         if passive:  # 自动弹窗模式：不抢键盘焦点
             self.set_focus_on_map(False)
@@ -157,6 +169,7 @@ class TranslateWin(Gtk.Window):
             GLib.idle_add(self.fetch_text)
 
     def fetch_text(self):
+        log('fetch_text: start')
         text = ''
         # 1) 问 GPaste 要最新条目（D-Bus，不依赖 GDK 的 Wayland selection 时序）
         try:
@@ -164,14 +177,16 @@ class TranslateWin(Gtk.Window):
             res = bus.call_sync('org.gnome.GPaste', '/org/gnome/GPaste',
                                 'org.gnome.GPaste2', 'GetElementAtIndex',
                                 GLib.Variant('(t)', (0,)), None,
-                                Gio.DBusCallFlags.NONE, -1, None)
+                                Gio.DBusCallFlags.NONE, 5, None)
             text = (res.unpack()[1] or '').strip()
-        except Exception:
-            pass
+        except Exception as e:
+            log('fetch_text: gpaste failed: %s' % e)
         # 2) fallback：GDK 读（此时窗口已映射，可正常读取）
         if not text:
+            log('fetch_text: falling back to GDK clipboard')
             cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
             text = (cb.wait_for_text() or '').strip()
+        log('fetch_text: got %d chars' % len(text))
         self.src_text = text
         self.src_buf.set_text(text[:3000] if text else '(剪贴板为空)')
         self.after_text_ready()
@@ -186,6 +201,7 @@ class TranslateWin(Gtk.Window):
 
     def show_new_text(self, text, present):
         """socket 推送的新内容：原地更新（present=手动触发时前置窗口）"""
+        log('show_new_text: present=%s len=%d' % (present, len(text)))
         if present:
             self.present()
         if text:
@@ -339,8 +355,11 @@ if __name__ == '__main__':
     srv = try_bind()
     if srv is None:
         # 已有常驻实例：转交文本后退出（手动打开→前置窗口；自动→安静更新）
+        log('main: existing instance found, forwarding text and exiting')
         send_to_existing(text_arg or '', manual=not passive)
         sys.exit(0)
+    log('main: becoming the resident instance (passive=%s text_arg=%s)'
+        % (passive, 'yes' if text_arg is not None else 'no'))
     signal.signal(signal.SIGTERM, lambda *a: Gtk.main_quit())
     win = TranslateWin(load_conf(), text_arg, passive)
     threading.Thread(target=serve_socket, args=(srv, win), daemon=True).start()
