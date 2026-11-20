@@ -204,6 +204,10 @@ class TranslateWin(Gtk.Window):
         log('show_new_text: present=%s len=%d' % (present, len(text)))
         if present:
             self.present()
+        else:
+            # 自动模式：窗口若处于最小化状态则恢复显示（deiconify 不抢焦点，
+            # 对正常显示的窗口无副作用）
+            self.deiconify()
         if text:
             self.src_text = text.strip()
             self.src_buf.set_text(self.src_text[:3000] if self.src_text else '(剪贴板为空)')
