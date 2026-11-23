@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=暂停自动翻译
+Comment=剪贴板翻译应急开关：直接改状态文件，不依赖GUI
+Exec=clip-translate-ctl off
+Icon=process-stop
+Categories=Utility;
+Keywords=fanyi;off;暂停;翻译;

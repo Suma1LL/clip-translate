@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=恢复自动翻译
+Comment=剪贴板翻译应急开关
+Exec=clip-translate-ctl on
+Icon=media-playback-start
+Categories=Utility;
+Keywords=fanyi;on;恢复;翻译;

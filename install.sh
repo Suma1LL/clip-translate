@@ -13,10 +13,10 @@ python3 -c "import gi; gi.require_version('Gtk','3.0')" 2>/dev/null \
 
 # 安装文件
 mkdir -p ~/.local/bin ~/.config/systemd/user ~/.local/share/applications
-cp clip-translate-gui clip-translate-watch ~/.local/bin/
-chmod +x ~/.local/bin/clip-translate-gui ~/.local/bin/clip-translate-watch
+cp clip-translate-gui clip-translate-watch clip-translate-ctl ~/.local/bin/
+chmod +x ~/.local/bin/clip-translate-gui ~/.local/bin/clip-translate-watch ~/.local/bin/clip-translate-ctl
 cp clip-translate-watch.service ~/.config/systemd/user/
-cp clip-translate.desktop ~/.local/share/applications/
+cp clip-translate.desktop clip-translate-off.desktop clip-translate-on.desktop clip-translate-restart.desktop ~/.local/share/applications/
 
 # 初始化配置（不覆盖已有配置）
 if [ ! -f ~/.config/clip-translate.conf ]; then
