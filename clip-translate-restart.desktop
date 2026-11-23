@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=重启翻译窗口
-Comment=杀掉可能卡住的窗口并重开（显示当前剪贴板内容）
-Exec=clip-translate-ctl restart
-Icon=view-refresh
-Categories=Utility;
-Keywords=fanyi;restart;重启;翻译;
