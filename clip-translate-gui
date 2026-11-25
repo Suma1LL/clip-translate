@@ -189,10 +189,13 @@ class TranslateWin(Gtk.Window):
         log('fetch_text: got %d chars' % len(text))
         self.src_text = text
         self.src_buf.set_text(text[:3000] if text else '(剪贴板为空)')
+        log('fetch_text: src_buf updated, calling after_text_ready')
         self.after_text_ready()
+        log('fetch_text: after_text_ready returned')
         return False
 
     def after_text_ready(self):
+        log('after_text_ready: english=%s len=%d' % (is_english(self.src_text or ''), len(self.src_text or '')))
         if self.src_text and is_english(self.src_text):
             self.retranslate()
         else:
@@ -205,9 +208,21 @@ class TranslateWin(Gtk.Window):
         if present:
             self.present()
         else:
-            # 自动模式：窗口若处于最小化状态则恢复显示（deiconify 不抢焦点，
-            # 对正常显示的窗口无副作用）
-            self.deiconify()
+            # 自动模式：仅当窗口被最小化时才还原，已可见则完全不动（不闪烁、不抢焦点）。
+            # 注意不能用 deiconify()：X11 下被 WM 最小化的窗口 widget 仍视为 mapped，
+            # GTK 会直接早退导致还原失败，还会触发 _NET_WM_STATE_DEMANDS_ATTENTION
+            # （Dock 图标弹跳闪烁）；present() 走 _NET_ACTIVE_WINDOW 能可靠还原，
+            # 且配合 focus_on_map=False 不会抢键盘焦点。
+            w = self.get_window()
+            iconified = False
+            if w is not None:
+                try:
+                    iconified = bool(w.get_state() & Gdk.WindowState.ICONIFIED)
+                except Exception:
+                    pass
+            log('show_new_text: iconified=%s' % iconified)
+            if iconified:
+                self.present()
         if text:
             self.src_text = text.strip()
             self.src_buf.set_text(self.src_text[:3000] if self.src_text else '(剪贴板为空)')
@@ -233,6 +248,7 @@ class TranslateWin(Gtk.Window):
         self.req_no_think = any(m == self.req_model and dis for m, _, dis in ENGINES)
         self.dst_buf.set_text('')
         self.spinner.start()
+        log('retranslate: gen=%d model=%s' % (self.gen, self.req_model))
         threading.Thread(target=self.worker, daemon=True).start()
 
     def worker(self):
@@ -272,8 +288,10 @@ class TranslateWin(Gtk.Window):
                         GLib.idle_add(self.append, gen, '\n[错误] ' + msg)
                         break
         except Exception as e:
+            log('worker: request failed: %s' % e)
             GLib.idle_add(self.append, gen, '\n[错误] %s' % e)
         GLib.idle_add(self.stop_spinner, gen)
+        log('worker: finished (gen=%d)' % gen)
 
     def append(self, gen, text):
         if gen != self.gen:
