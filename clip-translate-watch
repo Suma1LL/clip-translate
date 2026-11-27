@@ -2,15 +2,19 @@
 # clip-translate-watch: 订阅 GPaste 剪贴板事件 → 复制英文自动弹翻译窗口（passive 模式，不抢焦点）
 # systemd user service: clip-translate-watch.service
 # 自愈机制：D-Bus 连接断开或 GPaste 持续不可达时主动退出，由 systemd Restart=always 拉起重建
-import os, re, signal, socket, subprocess
+import os, re, signal, socket, subprocess, time
 from gi.repository import Gio, GLib
 
 GUI = os.path.expanduser('~/.local/bin/clip-translate-gui')
 ENABLED_FILE = os.path.expanduser('~/.config/clip-translate.enabled')
+PID_FILE = '/tmp/clip-translate-gui.pid'
 SOCK = '\0clip-translate-gui'  # 常驻翻译窗口的 abstract unix socket
 GPASTE_DAEMON = '/usr/libexec/gpaste/gpaste-daemon'
 DEST, PATH, IFACE = 'org.gnome.GPaste', '/org/gnome/GPaste', 'org.gnome.GPaste2'
 MAX_LEN = 5000
+# 常驻窗口最长寿命（秒）：XWayland 长驻窗口可能状态漂移导致交互失灵，
+# 到期后在下一次推送时静默换新窗口（位置由 GUI 自己保存/恢复）
+MAX_AGE = int(os.environ.get('CLIP_TRANSLATE_MAX_AGE', '7200'))
 
 fail_count = 0
 last_seen_text = None  # 上次已知的 GPaste 历史[0]，用于假死恢复后补漏
@@ -71,17 +75,76 @@ def gpaste_pid():
     return None
 
 
-def launch_gui(text):
-    """优先推送给常驻窗口（原地更新，不闪跳）；无实例时启动新窗口"""
+def gui_pid():
+    """常驻 GUI 的 PID（PID 文件 + cmdline 校验，防 PID 复用误杀）"""
     try:
-        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        c.settimeout(2)
-        c.connect(SOCK)
-        c.sendall(b'W' + text.encode())
-        c.close()
-        return
+        pid = int(open(PID_FILE).read().strip())
+        with open('/proc/%d/cmdline' % pid, 'rb') as f:
+            if b'clip-translate-gui' in f.read():
+                return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def gui_age():
+    """常驻 GUI 已运行秒数（读 /proc/<pid>/stat 的 starttime）"""
+    pid = gui_pid()
+    if pid is None:
+        return None
+    try:
+        with open('/proc/%d/stat' % pid, 'rb') as f:
+            fields = f.read().rsplit(b')', 1)[1].split()
+        start_ticks = int(fields[19])
+        with open('/proc/uptime') as f:
+            uptime = float(f.read().split()[0])
+        return max(0.0, uptime - start_ticks / os.sysconf('SC_CLK_TCK'))
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def kill_gui(reason):
+    """优雅关掉常驻窗口（SIGTERM→SIGKILL 兜底）"""
+    pid = gui_pid()
+    if pid is None:
+        return False
+    print('recycling gui (pid=%d, reason=%s)' % (pid, reason), flush=True)
+    try:
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(0.6)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
     except OSError:
         pass
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+    return True
+
+
+def launch_gui(text):
+    """推送文本给常驻窗口：要求 ACK；超龄或无 ACK 时换新窗口（位置自动恢复）"""
+    age = gui_age()
+    if age is not None and MAX_AGE > 0 and age > MAX_AGE:
+        kill_gui('age %.0fs > %ds' % (age, MAX_AGE))
+    if gui_pid() is not None:
+        try:
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.settimeout(2.5)
+            c.connect(SOCK)
+            c.sendall(b'W' + text.encode())
+            c.shutdown(socket.SHUT_WR)  # 半关闭：让 GUI 读到 EOF 后开始处理并回 ACK
+            ack = c.recv(16)
+            c.close()
+            if ack == b'OK':
+                return
+            print('gui ack missing (got %r), replacing' % ack, flush=True)
+        except OSError as e:
+            print('gui push failed (%s), replacing' % e, flush=True)
+        kill_gui('unresponsive')
     try:
         subprocess.Popen([GUI, '--passive', '--text', text], start_new_session=True)
     except Exception as e:
@@ -164,6 +227,17 @@ def on_update(conn, sender, path, iface, sig_name, params):
         launch_gui(text)
 
 
+def on_prepare_for_sleep(conn, sender, path, iface, sig, params):
+    """休眠唤醒后回收窗口：唤醒是 XWayland 窗口输入失效的高发触发点"""
+    try:
+        sleeping = params.unpack()[0]
+    except Exception:
+        return
+    if not sleeping:
+        print('resumed from sleep, recycling gui', flush=True)
+        kill_gui('resume from sleep')
+
+
 signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # 自动回收子进程，防 spawn 的 daemon 退出后变僵尸
 print('watch started, pid=%d' % os.getpid(), flush=True)
 if not gpaste_alive():
@@ -174,5 +248,13 @@ except Exception:
     last_seen_text = None
 bus.signal_subscribe(None, IFACE, 'Update', PATH, None,
                      Gio.DBusSignalFlags.NONE, on_update)
+try:  # 休眠唤醒钩子（logind 在系统总线）
+    sysbus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    sysbus.signal_subscribe('org.freedesktop.login1', 'org.freedesktop.login1.Manager',
+                            'PrepareForSleep', '/org/freedesktop/login1', None,
+                            Gio.DBusSignalFlags.NONE, on_prepare_for_sleep)
+    print('logind suspend hook ready', flush=True)
+except Exception as e:
+    print('logind subscribe failed: %s' % e, flush=True)
 GLib.timeout_add_seconds(30, health_check)
 GLib.MainLoop().run()
